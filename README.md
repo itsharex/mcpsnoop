@@ -57,6 +57,42 @@ mcpsnoop
 No flags, no socket paths, no startup order to remember. The shim and the UI find
 each other on their own, and the UI backfills past sessions from disk.
 
+To watch traffic from another machine, keep capture local to that machine and
+use SSH for the network hop. SSH provides authentication, encryption, host
+verification, and bastion support without mcpsnoop adding its own remote
+transport.
+
+For a live view, run the TUI on your workstation and forward the remote
+machine's mcpsnoop socket back to it. The exact socket path depends on
+`MCPSNOOP_HOME`, `XDG_STATE_HOME`, and the remote user's home directory; the
+default is `~/.local/state/mcpsnoop/hub.sock`.
+
+```bash
+# terminal 1, on your workstation
+mcpsnoop
+
+# once, make sure the remote socket directory exists
+ssh remote-user@remote-host 'mkdir -p ~/.local/state/mcpsnoop'
+
+# terminal 2, on your workstation; keep this SSH session open
+ssh -N -o StreamLocalBindUnlink=yes \
+  -R /home/remote-user/.local/state/mcpsnoop/hub.sock:$HOME/.local/state/mcpsnoop/hub.sock \
+  remote-user@remote-host
+
+# remote host, in your MCP server config, use the usual local shim
+mcpsnoop -- node build/index.js
+```
+
+For post-mortem review, copy the remote JSONL sessions into your local
+mcpsnoop sessions directory and then open the TUI normally.
+
+```bash
+mkdir -p ~/.local/state/mcpsnoop/sessions
+scp remote-user@remote-host:'~/.local/state/mcpsnoop/sessions/*.jsonl' \
+  ~/.local/state/mcpsnoop/sessions/
+mcpsnoop
+```
+
 For a streamable-HTTP server, run mcpsnoop as a reverse proxy.
 
 ```bash
@@ -193,6 +229,11 @@ TUI, press `e` to export the selected session as HTML, or run
 mcpsnoop runs the server command you wrap, so only wrap servers you trust, and
 run untrusted ones in a container. It never executes anything you didn't put in
 your client config.
+
+Captured frames can include prompts, tool arguments, credentials, and tool
+results. For remote workflows, use SSH tunnelling or SSH file transfer so
+transport auth, encryption, host verification, key rotation, and audit policy
+stay in your existing SSH setup.
 
 ## Contributing
 
