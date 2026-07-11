@@ -1,11 +1,11 @@
 // Command mcpsnoop is a transparent proxy debugger for MCP traffic.
 //
-// Two modes, one binary:
+// Two modes in one binary.
 //
 //	mcpsnoop -- <server command>   run as a transparent stdio shim (the client
-//	                              spawns this; it proxies stdio to the real
+//	                              spawns this, and it proxies stdio to the real
 //	                              server and traces every JSON-RPC frame).
-//	mcpsnoop                       run the live TUI in your terminal: collect
+//	mcpsnoop                       run the live TUI in your terminal, collecting
 //	                              traffic from all shims and past sessions.
 package main
 
@@ -20,6 +20,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"runtime/debug"
+	"slices"
 	"strings"
 	"syscall"
 
@@ -33,9 +34,9 @@ import (
 // version is overridden at build time via -ldflags "-X main.version=...".
 var version = "dev"
 
-// appVersion resolves the version to report: the value baked in by -ldflags
-// (release builds and `make build`), else the module version embedded by
-// `go install ...@vX`, else "dev" for a plain local build.
+// appVersion resolves the version to report. It uses the value baked in by
+// -ldflags (release builds and `make build`), else the module version embedded
+// by `go install ...@vX`, else "dev" for a plain local build.
 func appVersion() string {
 	if version != "dev" {
 		return version
@@ -136,22 +137,61 @@ func main() {
 	fs.Var(&redactKeys, "redact-key", "JSON key name to scrub in saved trace payloads (repeat or comma-separated)")
 	fs.Var(&redactValues, "redact-value", "regular expression to scrub inside observed string values, stderr, and non-JSON text (repeatable)")
 	fs.Usage = func() {
-		fmt.Fprintf(os.Stderr, "mcpsnoop %s — Wireshark for MCP\n\n", appVersion())
+		fmt.Fprintf(os.Stderr, "mcpsnoop %s · Wireshark for MCP\n\n", appVersion())
 		fmt.Fprintf(os.Stderr, "Usage:\n")
-		fmt.Fprintf(os.Stderr, "  mcpsnoop [flags] -- <server command> [args...]   run as transparent stdio shim\n")
-		fmt.Fprintf(os.Stderr, "  mcpsnoop http --target <url> [--listen :7000]     run as transparent HTTP proxy\n")
-		fmt.Fprintf(os.Stderr, "  mcpsnoop export [-T json|html|text|otlp] [-o file|-] [session-id|log.jsonl]\n")
-		fmt.Fprintf(os.Stderr, "  mcpsnoop open [session-id|log.jsonl|-]            open a session in the TUI\n")
-		fmt.Fprintf(os.Stderr, "  mcpsnoop remote [flags] <user@host>              print SSH tunnel command\n")
-		fmt.Fprintf(os.Stderr, "  mcpsnoop                                          run the live TUI (collector)\n")
-		fmt.Fprintf(os.Stderr, "  mcpsnoop demo                                     play a scripted session (no setup)\n\n")
-		fmt.Fprintf(os.Stderr, "Flags:\n")
+		cmds := []struct{ use, desc string }{
+			{"mcpsnoop [flags] -- <server command> [args...]", "run as a transparent stdio shim"},
+			{"mcpsnoop http --target <url> [--listen :7000]", "run as a transparent HTTP proxy"},
+			{"mcpsnoop export [-T json|html|text|otlp] [-o file|-] [session-id|log.jsonl]", ""},
+			{"mcpsnoop open [session-id|log.jsonl|-]", "open a session in the TUI"},
+			{"mcpsnoop remote [flags] <user@host>", "print the SSH tunnel command"},
+			{"mcpsnoop", "run the live TUI (collector)"},
+			{"mcpsnoop demo", "play a scripted session (no setup)"},
+			{"mcpsnoop version", "print the version"},
+			{"mcpsnoop help [command]", "show help for mcpsnoop or a command"},
+		}
+		col := 0
+		for _, c := range cmds {
+			if c.desc != "" && len(c.use) > col {
+				col = len(c.use)
+			}
+		}
+		for _, c := range cmds {
+			if c.desc == "" {
+				fmt.Fprintf(os.Stderr, "  %s\n", c.use)
+				continue
+			}
+			fmt.Fprintf(os.Stderr, "  %-*s   %s\n", col, c.use, c.desc)
+		}
+		fmt.Fprintf(os.Stderr, "\nFlags:\n")
 		fs.PrintDefaults()
+		fmt.Fprintf(os.Stderr, "\nThe shim flags above can also be set in a .mcpsnoop.toml file in the\ncurrent directory. See the README for details.\n")
 	}
 	_ = fs.Parse(os.Args[1:])
 
 	if *showVer {
 		fmt.Println("mcpsnoop", appVersion())
+		return
+	}
+
+	// `mcpsnoop help [command]` prints usage, so help is discoverable without -h
+	// and "help" is never mistaken for a server command to run. A `--` means the
+	// user is explicitly wrapping a command, so `mcpsnoop -- help` still runs it.
+	if rest := fs.Args(); len(rest) > 0 && rest[0] == "help" && !slices.Contains(os.Args[1:], "--") {
+		switch {
+		case len(rest) < 2:
+			fs.Usage()
+		case rest[1] == "http":
+			runHTTP([]string{"-h"})
+		case rest[1] == "export":
+			runExport([]string{"-h"})
+		case rest[1] == "open":
+			runOpen([]string{"-h"})
+		case rest[1] == "remote":
+			runRemote([]string{"-h"})
+		default:
+			fs.Usage()
+		}
 		return
 	}
 
@@ -192,7 +232,7 @@ var runnerNames = map[string]bool{
 	"uvx": true, "pipx": true, "sh": true, "bash": true, "env": true, "go": true,
 }
 
-// labelFor derives a friendly session name from the wrapped command: it skips
+// labelFor derives a friendly session name from the wrapped command. It skips
 // runners/flags and prefers a token that looks like a server (contains "server"
 // or "mcp", an @scope/name, or a script file), falling back to the first real
 // argument or the command itself.
@@ -289,7 +329,7 @@ func runExport(args []string) int {
 }
 
 // runShim runs the transparent stdio proxy. It writes the durable session log
-// AND streams live to the hub; neither has to be running first.
+// AND streams live to the hub. Neither has to be running first.
 func runShim(command []string, label, traceFile string, noTrace bool, redaction proxy.RedactConfig) int {
 	if label == "" {
 		label = labelFor(command)
@@ -320,7 +360,7 @@ func runShim(command []string, label, traceFile string, noTrace bool, redaction 
 	return code
 }
 
-// traceSink builds the shared sink: a durable per-session JSONL log plus a
+// traceSink builds the shared sink, a durable per-session JSONL log plus a
 // best-effort live stream to the hub. Returns a no-op sink when disabled.
 func traceSink(sessionID, traceFile string, noTrace bool, redaction proxy.RedactConfig) proxy.Sink {
 	if noTrace {
